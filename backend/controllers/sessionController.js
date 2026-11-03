@@ -1,7 +1,7 @@
 const Session = require("../models/Session");
 const Attendance = require("../models/Attendance");
 
-const INACTIVITY_LIMIT_MS = 3000;
+const { INACTIVITY_LIMIT_MS } = require("../config/attendanceRules");
 
 /* =========================
    CODE GENERATION
