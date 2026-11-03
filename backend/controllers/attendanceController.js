@@ -1,8 +1,12 @@
+const mongoose = require("mongoose");
 const Attendance = require("../models/Attendance");
 const Session = require("../models/Session");
 const Student = require("../models/Student");
-
-const INACTIVITY_LIMIT_MS = 3000;
+const {
+  INACTIVITY_LIMIT_MS,
+  HEARTBEAT_WRITE_EVERY_MS,
+  INACTIVITY_REASON,
+} = require("../config/attendanceRules");
 
 function publicAttendance(attendance) {
   return {
@@ -45,7 +49,7 @@ async function markStaleAttendance(sessionId, now = new Date()) {
       $set: {
         status: "Incomplete",
         isActive: false,
-        inactiveReason: "Missed heartbeat for more than 3 seconds.",
+        inactiveReason: INACTIVITY_REASON,
         completedAt: now,
       },
     }
@@ -155,7 +159,7 @@ exports.submitAttendance = async (req, res) => {
         blocker.status = "Incomplete";
         blocker.isActive = false;
         blocker.completedAt = now;
-        blocker.inactiveReason = "Missed heartbeat for more than 3 seconds.";
+        blocker.inactiveReason = INACTIVITY_REASON;
         await blocker.save();
       }
 
@@ -233,7 +237,7 @@ exports.submitAttendance = async (req, res) => {
         existingAttendance.status = "Incomplete";
         existingAttendance.isActive = false;
         existingAttendance.completedAt = now;
-        existingAttendance.inactiveReason = "Missed heartbeat for more than 3 seconds.";
+        existingAttendance.inactiveReason = INACTIVITY_REASON;
         await existingAttendance.save();
       }
 
@@ -297,7 +301,10 @@ exports.submitAttendance = async (req, res) => {
   }
 };
 
-exports.heartbeat = async (req, res) => {
+// The full heartbeat check. It handles every case, including the unusual ones
+// (finalized, marked incomplete, missing records), and is the fallback for the
+// fast path below.
+const heartbeatFromDatabase = async (req, res) => {
   try {
     const { attendanceId } = req.body;
 
@@ -347,7 +354,7 @@ exports.heartbeat = async (req, res) => {
       attendance.status = "Incomplete";
       attendance.isActive = false;
       attendance.completedAt = now;
-      attendance.inactiveReason = "Missed heartbeat for more than 3 seconds.";
+      attendance.inactiveReason = INACTIVITY_REASON;
       await attendance.save();
 
       return res.status(403).json({
@@ -372,6 +379,120 @@ exports.heartbeat = async (req, res) => {
       status: attendance.status,
       serverTime: now,
       expiresAt: session.expiresAt,
+    });
+  } catch (error) {
+    res.status(500).json({
+      message: "Heartbeat failed.",
+      error: error.message,
+    });
+  }
+};
+
+// Heartbeat fast path.
+//
+// Every student pings every couple of seconds, so with a full class this is by
+// far the busiest route. Most pings only need to confirm "still here", so we
+// remember each running attendance in memory and save to the database at most
+// once every HEARTBEAT_WRITE_EVERY_MS. Anything unusual falls back to the full
+// check above. A session's expiry time never changes, so caching it is safe.
+const heartbeatCache = new Map();
+
+setInterval(() => {
+  const cutoff = Date.now() - 60 * 1000;
+
+  for (const [attendanceId, entry] of heartbeatCache) {
+    if (entry.expiresAtMs < cutoff) heartbeatCache.delete(attendanceId);
+  }
+}, 60 * 1000).unref();
+
+exports.heartbeat = async (req, res) => {
+  try {
+    const { attendanceId } = req.body;
+
+    if (!attendanceId || !mongoose.isValidObjectId(attendanceId)) {
+      return heartbeatFromDatabase(req, res);
+    }
+
+    const nowMs = Date.now();
+    const cached = heartbeatCache.get(attendanceId);
+
+    if (
+      cached &&
+      cached.studentId === req.user.id &&
+      nowMs < cached.expiresAtMs &&
+      nowMs - cached.savedAtMs < HEARTBEAT_WRITE_EVERY_MS
+    ) {
+      return res.status(200).json({
+        message: "Heartbeat recorded.",
+        status: "Pending",
+        serverTime: new Date(nowMs),
+        expiresAt: new Date(cached.expiresAtMs),
+      });
+    }
+
+    const now = new Date(nowMs);
+
+    // One write that only succeeds for this student's own, still-running attendance.
+    const updated = await Attendance.findOneAndUpdate(
+      {
+        _id: attendanceId,
+        studentId: req.user.id,
+        status: "Pending",
+        isActive: true,
+        lastActive: { $gte: new Date(nowMs - INACTIVITY_LIMIT_MS) },
+      },
+      { $set: { lastActive: now } },
+      { projection: { sessionId: 1 } }
+    ).lean();
+
+    if (!updated) {
+      heartbeatCache.delete(attendanceId);
+      return heartbeatFromDatabase(req, res);
+    }
+
+    let expiresAtMs = cached ? cached.expiresAtMs : null;
+
+    if (expiresAtMs === null) {
+      const session = await Session.findById(updated.sessionId, { expiresAt: 1 }).lean();
+
+      if (!session) {
+        return heartbeatFromDatabase(req, res);
+      }
+
+      expiresAtMs = session.expiresAt.getTime();
+    }
+
+    if (nowMs >= expiresAtMs) {
+      await Attendance.updateOne(
+        { _id: updated._id, status: "Pending" },
+        { $set: { status: "Confirmed", isActive: false, completedAt: now } }
+      );
+      await Session.updateOne(
+        { _id: updated.sessionId, status: "active" },
+        { $set: { status: "expired" } }
+      );
+
+      heartbeatCache.delete(attendanceId);
+
+      return res.status(200).json({
+        message: "Heartbeat recorded.",
+        status: "Confirmed",
+        serverTime: now,
+        expiresAt: new Date(expiresAtMs),
+      });
+    }
+
+    heartbeatCache.set(attendanceId, {
+      studentId: req.user.id,
+      expiresAtMs,
+      savedAtMs: nowMs,
+    });
+
+    return res.status(200).json({
+      message: "Heartbeat recorded.",
+      status: "Pending",
+      serverTime: now,
+      expiresAt: new Date(expiresAtMs),
     });
   } catch (error) {
     res.status(500).json({
