@@ -5,6 +5,7 @@ const connectDB = require("./config/db");
 const authRoutes = require("./routes/authRoutes");
 const attendanceRoutes = require("./routes/attendanceRoutes");
 const sessionRoutes = require("./routes/sessionRoutes");
+const { finalizeDueSessions } = require("./controllers/attendanceController");
 
 dotenv.config();
 connectDB();
@@ -43,3 +44,6 @@ app.use("/api/attendance", attendanceRoutes);
 app.listen(PORT, () => {
   console.log(`Server running on http://localhost:${PORT}`);
 });
+
+// Finish sessions whose time is up, even if nobody is looking at the dashboard.
+setInterval(finalizeDueSessions, 2000);
