@@ -57,7 +57,11 @@ async function markStaleAttendance(sessionId, now = new Date()) {
 }
 
 async function finalizeExpiredAttendance(session, now = new Date()) {
-  await markStaleAttendance(session._id, now);
+  // After the session ends, everyone is judged as of the end time, so the result
+  // is the same whether this runs one second or one minute later.
+  const judgedAt = now >= session.expiresAt ? session.expiresAt : now;
+
+  await markStaleAttendance(session._id, judgedAt);
 
   if (now < session.expiresAt) return;
 
@@ -66,7 +70,7 @@ async function finalizeExpiredAttendance(session, now = new Date()) {
       sessionId: session._id,
       status: "Pending",
       isActive: true,
-      lastActive: { $gte: new Date(now.getTime() - INACTIVITY_LIMIT_MS) },
+      lastActive: { $gte: new Date(judgedAt.getTime() - INACTIVITY_LIMIT_MS) },
     },
     {
       $set: {
@@ -91,6 +95,36 @@ async function finalizeExpiredAttendance(session, now = new Date()) {
     }
   );
 }
+
+// Finishes sessions whose time is up, whether or not anyone is watching the
+// lecturer dashboard or sending a final heartbeat. server.js runs this every
+// couple of seconds. Running it again on a finished session changes nothing.
+let finalizingDueSessions = false;
+
+exports.finalizeDueSessions = async () => {
+  if (finalizingDueSessions) return;
+  finalizingDueSessions = true;
+
+  try {
+    const now = new Date();
+    const dueSessions = await Session.find({
+      status: "active",
+      expiresAt: { $lte: now },
+    }).limit(25);
+
+    for (const session of dueSessions) {
+      await finalizeExpiredAttendance(session, now);
+      await Session.updateOne(
+        { _id: session._id, status: "active" },
+        { $set: { status: "expired" } }
+      );
+    }
+  } catch (error) {
+    console.error("Finalizing expired sessions failed:", error.message);
+  } finally {
+    finalizingDueSessions = false;
+  }
+};
 
 exports.submitAttendance = async (req, res) => {
   try {

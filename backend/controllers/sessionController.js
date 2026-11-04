@@ -91,7 +91,8 @@ exports.createSession = async (req, res) => {
     // 🔥 IMPORTANT: Only lecturer sees code
     res.status(201).json({
       message: "Session created.",
-      session
+      session,
+      serverTime: new Date()
     });
 
   } catch (error) {
@@ -127,7 +128,8 @@ exports.getActiveSession = async (req, res) => {
 
     res.status(200).json({
       message: "Active session fetched.",
-      session
+      session,
+      serverTime: new Date()
     });
 
   } catch (error) {
@@ -272,7 +274,8 @@ exports.getSessionByCode = async (req, res) => {
         duration: session.duration,
         expiresAt: session.expiresAt,
         status: session.status
-      }
+      },
+      serverTime: new Date()
     });
 
   } catch (error) {
