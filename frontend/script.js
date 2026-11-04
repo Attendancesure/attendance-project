@@ -18,7 +18,48 @@ const STORAGE_KEYS = {
 
 let lecturerHistoryCache = [];
 let dashboardInterval = null;
+let dashboardCountdownInterval = null;
 let verificationInterval = null;
+
+/* =========================
+   Server clock
+   Countdowns follow the server's clock, not the device's. A phone or PC that is
+   a few seconds fast would otherwise reach 00:00 early and report "Incomplete"
+   while the session is still running. Every API reply that carries `serverTime`
+   refreshes the offset.
+========================= */
+const CLOCK_OFFSET_KEY = "attendsure_clock_offset";
+let serverClockOffsetMs = 0;
+
+try {
+  serverClockOffsetMs = Number(localStorage.getItem(CLOCK_OFFSET_KEY)) || 0;
+} catch (error) {
+  serverClockOffsetMs = 0;
+}
+
+function serverNow() {
+  return Date.now() + serverClockOffsetMs;
+}
+
+function syncServerClock(serverTime, requestSentAt) {
+  const serverMs = new Date(serverTime).getTime();
+  if (!Number.isFinite(serverMs)) return;
+
+  const receivedAt = Date.now();
+  const halfTripMs = requestSentAt ? Math.max(0, (receivedAt - requestSentAt) / 2) : 0;
+  const nextOffset = serverMs + halfTripMs - receivedAt;
+
+  // Ignore tiny changes so the countdown does not twitch from network jitter.
+  if (Math.abs(nextOffset - serverClockOffsetMs) < 300) return;
+
+  serverClockOffsetMs = nextOffset;
+
+  try {
+    localStorage.setItem(CLOCK_OFFSET_KEY, String(nextOffset));
+  } catch (error) {
+    // Storage can be blocked; the offset still works for this page.
+  }
+}
 
 /* =========================
    General Helpers
@@ -105,12 +146,18 @@ async function apiRequest(path, options = {}) {
     headers.Authorization = `Bearer ${token}`;
   }
 
+  const requestSentAt = Date.now();
+
   const response = await fetch(`${API_BASE}${path}`, {
     ...options,
     headers
   });
 
   const data = await response.json().catch(() => ({}));
+
+  if (data && data.serverTime) {
+    syncServerClock(data.serverTime, requestSentAt);
+  }
 
   if (!response.ok) {
     throw new Error(data.message || "Request failed.");
@@ -987,7 +1034,7 @@ function initLecturerDashboard() {
     const session = getSession();
     if (!session) return;
 
-    const timeLeft = session.expiresAt - Date.now();
+    const timeLeft = session.expiresAt - serverNow();
 
     if (timeLeft <= 0) {
       if (countdownText) countdownText.textContent = "00:00";
@@ -1118,11 +1165,14 @@ function initLecturerDashboard() {
     await refreshActiveDashboardData();
   });
 
+  // The countdown has its own one-second timer. It used to share the 3-second
+  // timer below, which made it jump three seconds at a time.
+  clearInterval(dashboardCountdownInterval);
+  dashboardCountdownInterval = setInterval(updateDashboardCountdown, 1000);
+
   clearInterval(dashboardInterval);
 
   dashboardInterval = setInterval(async () => {
-    updateDashboardCountdown();
-
     const activeSession = getSession();
     if (activeSession && !getSelectedHistorySession()) {
       await renderLecturerAttendanceTable();
@@ -1239,26 +1289,67 @@ function initStudentVerification() {
     redirectWithDelay("student-incomplete.html", 700);
   }
 
+  // At the end of the countdown, ask the server for the verdict. The server is
+  // the one that knows whether the student stayed, so "still pending" or a failed
+  // request means ask again, not "Incomplete". Only an answer from the server
+  // saying Incomplete (or Expired) ends in the Incomplete screen.
+  async function confirmWithServer(context, attempt = 0) {
+    if (finalizing) return;
+
+    try {
+      const data = await sendHeartbeat(context.attendanceId);
+
+      if (data.status === "Confirmed") {
+        await handleVerificationSuccess(context);
+        return;
+      }
+
+      if (data.status === "Incomplete" || data.status === "Expired") {
+        await handleVerificationIncomplete(context);
+        return;
+      }
+    } catch (error) {
+      const message = (error.message || "").toLowerCase();
+
+      if (message.includes("incomplete") || message.includes("inactivity")) {
+        await handleVerificationIncomplete(context);
+        return;
+      }
+    }
+
+    // The reply may have just corrected our clock. If there is still time left on
+    // the server's clock, go back to counting down instead of waiting here.
+    const stillLeftMs = new Date(context.session.expiresAt).getTime() - serverNow();
+
+    if (stillLeftMs > 0) {
+      clearInterval(verificationInterval);
+      updateStudentCountdown();
+      verificationInterval = setInterval(updateStudentCountdown, 1000);
+      return;
+    }
+
+    if (attempt < 30) {
+      setTimeout(() => confirmWithServer(context, attempt + 1), 1000);
+    } else {
+      showAppAlert(
+        "We could not reach the server to confirm your attendance. Stay on this page and tell your lecturer.",
+        "error"
+      );
+    }
+  }
+
   function updateStudentCountdown() {
     const context = getVerificationContext();
     if (!context) return;
 
-    const timeLeft = new Date(context.session.expiresAt).getTime() - Date.now();
+    const timeLeft = new Date(context.session.expiresAt).getTime() - serverNow();
 
     if (timeLeft <= 0) {
       if (countdownText) countdownText.textContent = "00:00";
       if (progressFill) progressFill.style.width = "0%";
 
       clearInterval(verificationInterval);
-      sendHeartbeat(context.attendanceId)
-        .then((data) => {
-          if (data.status === "Confirmed") {
-            handleVerificationSuccess(context);
-          } else {
-            handleVerificationIncomplete(context);
-          }
-        })
-        .catch(() => handleVerificationIncomplete(context));
+      confirmWithServer(context);
       return;
     }
 
